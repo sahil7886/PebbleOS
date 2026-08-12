@@ -91,6 +91,10 @@ typedef struct WorkoutHeartRateDlsFinishData {
   uint32_t workout_id;
   uint32_t sequence;
   time_t end_utc;
+  // Buffered DataLogging writes run on the same System Task as this finalizer. Once the
+  // terminal record has been queued, run this callback once more after that write has had a
+  // chance to reach flash; finishing in the same turn can otherwise drop the commit record.
+  bool terminal_record_queued;
 } WorkoutHeartRateDlsFinishData;
 
 typedef struct WorkoutPpiDlsFinishData {
@@ -98,6 +102,7 @@ typedef struct WorkoutPpiDlsFinishData {
   uint32_t workout_id;
   uint32_t sequence;
   time_t end_utc;
+  bool terminal_record_queued;
 } WorkoutPpiDlsFinishData;
 
 static void prv_lock(void) {
@@ -268,26 +273,38 @@ static void prv_log_workout_ppi(CurrentWorkoutData *wrkt_data,
 // ---------------------------------------------------------------------------------------
 static void prv_finish_workout_heart_rate_dls_session(void *data) {
   WorkoutHeartRateDlsFinishData *finish_data = data;
-  WorkoutHeartRateDataLoggingRecord record = {
-    .workout_id = finish_data->workout_id,
-    .sequence = finish_data->sequence,
-    .timestamp_utc = (uint32_t)finish_data->end_utc,
-    .quality = -128, // terminal marker; not a sensor measurement
-    .flags = WORKOUT_HEART_RATE_FLAG_COMPLETE,
-    .version = WORKOUT_HEART_RATE_LOGGING_VERSION,
-  };
-  DataLoggingResult result = dls_log(finish_data->session, &record, 1);
-  // Buffered sessions can temporarily be full while their preceding samples are being written
-  // from the System Task queue.  The completion marker is the companion's commit record: losing
-  // it would leave every otherwise valid detail point pending forever.  Requeue behind that
-  // writer rather than finishing the session without a marker.
-  if (result == DATA_LOGGING_BUSY &&
-      system_task_add_callback(prv_finish_workout_heart_rate_dls_session, finish_data)) {
-    PBL_LOG_WRN("Workout HR completion buffer busy; retrying");
-    return;
-  }
-  if (result != DATA_LOGGING_SUCCESS) {
-    PBL_LOG_WRN("Workout HR completion log failed: %"PRIi32, (int32_t)result);
+  if (!finish_data->terminal_record_queued) {
+    WorkoutHeartRateDataLoggingRecord record = {
+      .workout_id = finish_data->workout_id,
+      .sequence = finish_data->sequence,
+      .timestamp_utc = (uint32_t)finish_data->end_utc,
+      .quality = -128, // terminal marker; not a sensor measurement
+      .flags = WORKOUT_HEART_RATE_FLAG_COMPLETE,
+      .version = WORKOUT_HEART_RATE_LOGGING_VERSION,
+    };
+    const DataLoggingResult result = dls_log(finish_data->session, &record, 1);
+    // Buffered sessions can temporarily be full while their preceding samples are being written
+    // from the System Task queue. The completion marker is the companion's commit record: losing
+    // it would leave every otherwise valid detail point pending forever.
+    if (result == DATA_LOGGING_BUSY &&
+        system_task_add_callback(prv_finish_workout_heart_rate_dls_session, finish_data)) {
+      PBL_LOG_WRN("Workout HR completion buffer busy; retrying");
+      return;
+    }
+    if (result != DATA_LOGGING_SUCCESS) {
+      PBL_LOG_WRN("Workout HR completion log failed: %"PRIi32, (int32_t)result);
+      dls_finish(finish_data->session);
+      kernel_free(finish_data);
+      return;
+    }
+
+    // dls_log has now queued the flash write behind this callback. Yield once so dls_finish()
+    // cannot time out and inactivate the session before that write persists the marker.
+    finish_data->terminal_record_queued = true;
+    if (system_task_add_callback(prv_finish_workout_heart_rate_dls_session, finish_data)) {
+      return;
+    }
+    PBL_LOG_WRN("Unable to defer Workout HR completion close");
   }
   dls_finish(finish_data->session);
   kernel_free(finish_data);
@@ -296,22 +313,33 @@ static void prv_finish_workout_heart_rate_dls_session(void *data) {
 // ---------------------------------------------------------------------------------------
 static void prv_finish_workout_ppi_dls_session(void *data) {
   WorkoutPpiDlsFinishData *finish_data = data;
-  WorkoutPpiDataLoggingRecord record = {
-    .workout_id = finish_data->workout_id,
-    .sequence = finish_data->sequence,
-    .timestamp_utc = (uint32_t)finish_data->end_utc,
-    .quality = -128, // terminal marker; not a sensor measurement
-    .flags_and_version = (WORKOUT_PPI_LOGGING_VERSION << WORKOUT_PPI_VERSION_SHIFT) |
-        WORKOUT_PPI_FLAG_COMPLETE,
-  };
-  const DataLoggingResult result = dls_log(finish_data->session, &record, 1);
-  if (result == DATA_LOGGING_BUSY &&
-      system_task_add_callback(prv_finish_workout_ppi_dls_session, finish_data)) {
-    PBL_LOG_WRN("Workout PPI completion buffer busy; retrying");
-    return;
-  }
-  if (result != DATA_LOGGING_SUCCESS) {
-    PBL_LOG_WRN("Workout PPI completion log failed: %"PRIi32, (int32_t)result);
+  if (!finish_data->terminal_record_queued) {
+    WorkoutPpiDataLoggingRecord record = {
+      .workout_id = finish_data->workout_id,
+      .sequence = finish_data->sequence,
+      .timestamp_utc = (uint32_t)finish_data->end_utc,
+      .quality = -128, // terminal marker; not a sensor measurement
+      .flags_and_version = (WORKOUT_PPI_LOGGING_VERSION << WORKOUT_PPI_VERSION_SHIFT) |
+          WORKOUT_PPI_FLAG_COMPLETE,
+    };
+    const DataLoggingResult result = dls_log(finish_data->session, &record, 1);
+    if (result == DATA_LOGGING_BUSY &&
+        system_task_add_callback(prv_finish_workout_ppi_dls_session, finish_data)) {
+      PBL_LOG_WRN("Workout PPI completion buffer busy; retrying");
+      return;
+    }
+    if (result != DATA_LOGGING_SUCCESS) {
+      PBL_LOG_WRN("Workout PPI completion log failed: %"PRIi32, (int32_t)result);
+      dls_finish(finish_data->session);
+      kernel_free(finish_data);
+      return;
+    }
+
+    finish_data->terminal_record_queued = true;
+    if (system_task_add_callback(prv_finish_workout_ppi_dls_session, finish_data)) {
+      return;
+    }
+    PBL_LOG_WRN("Unable to defer Workout PPI completion close");
   }
   dls_finish(finish_data->session);
   kernel_free(finish_data);
