@@ -4,8 +4,10 @@
 #include "sleep_capture.h"
 
 #include <pbl/drivers/rng.h>
+#include "kernel/pbl_malloc.h"
 #include "pbl/services/data_logging/data_logging_service.h"
 #include "pbl/services/activity/activity_private.h"
+#include "pbl/services/system_task.h"
 #include "util/time/time.h"
 #include "util/units.h"
 
@@ -64,6 +66,17 @@ typedef struct {
   AccelRawData previous_accel;
   bool has_previous_accel;
 } SleepCaptureState;
+
+// Keep the capture session alive until the terminal record has been persisted. Buffered
+// DataLogging can reject the first terminal append while it drains preceding PPI records.
+typedef struct {
+  DataLoggingSession *session;
+  uint32_t session_id;
+  uint16_t sequence;
+  time_t end_utc;
+  uint16_t dropped_records;
+  bool terminal_record_queued;
+} SleepCaptureDlsFinishData;
 
 static SleepCaptureState s_sleep_capture;
 
@@ -155,19 +168,68 @@ static void prv_reset_motion_epoch(time_t epoch_start_utc) {
   s_sleep_capture.motion_sample_count = 0;
 }
 
+static void prv_finish_capture_dls_session(void *data) {
+  SleepCaptureDlsFinishData *finish_data = data;
+  if (!finish_data->terminal_record_queued) {
+    SleepCaptureDataLoggingRecord record = {
+      .session_id = finish_data->session_id,
+      .sequence = finish_data->sequence,
+      .timestamp_utc = (uint32_t)finish_data->end_utc,
+      .value = finish_data->dropped_records,
+      .quality = SLEEP_CAPTURE_MOTION_QUALITY_UNKNOWN,
+      .type_flags = prv_type_flags(
+          SleepCaptureRecordType_Session,
+          SLEEP_CAPTURE_FLAG_COMPLETE |
+              ((finish_data->dropped_records != 0) ? SLEEP_CAPTURE_FLAG_DROPPED : 0)),
+    };
+    const DataLoggingResult result = dls_log(finish_data->session, &record, 1);
+    // The final record is the phone's proof that this is a complete capture. Retry a full
+    // staging buffer instead of closing the session and silently leaving valid PPI unusable.
+    if (result == DATA_LOGGING_BUSY &&
+        system_task_add_callback(prv_finish_capture_dls_session, finish_data)) {
+      PBL_LOG_WRN("Sleep capture completion buffer busy; retrying");
+      return;
+    }
+    if (result != DATA_LOGGING_SUCCESS) {
+      PBL_LOG_WRN("Sleep capture completion log failed: %"PRIi32, (int32_t)result);
+      dls_finish(finish_data->session);
+      kernel_free(finish_data);
+      return;
+    }
+
+    // dls_log only queues the flash write. Yield one System Task turn before closing so the
+    // terminal record cannot time out in the staging buffer and disappear from the stream.
+    finish_data->terminal_record_queued = true;
+    if (system_task_add_callback(prv_finish_capture_dls_session, finish_data)) {
+      return;
+    }
+    PBL_LOG_WRN("Unable to defer sleep capture completion close");
+  }
+  dls_finish(finish_data->session);
+  kernel_free(finish_data);
+}
+
 static void prv_finish_capture(time_t now_utc) {
   if (!s_sleep_capture.active) {
     return;
   }
 
   prv_flush_motion_epoch();
-  const uint8_t flags = SLEEP_CAPTURE_FLAG_COMPLETE |
-                        ((s_sleep_capture.dropped_records != 0) ? SLEEP_CAPTURE_FLAG_DROPPED : 0);
-  prv_log_record(SleepCaptureRecordType_Session, now_utc,
-                 prv_clamp_u16(s_sleep_capture.dropped_records),
-                 SLEEP_CAPTURE_MOTION_QUALITY_UNKNOWN, flags);
-  dls_finish(s_sleep_capture.dls_session);
+  SleepCaptureDlsFinishData *finish_data = kernel_zalloc_check(sizeof(*finish_data));
+  *finish_data = (SleepCaptureDlsFinishData) {
+    .session = s_sleep_capture.dls_session,
+    .session_id = s_sleep_capture.session_id,
+    .sequence = (uint16_t)s_sleep_capture.next_sequence,
+    .end_utc = now_utc,
+    .dropped_records = prv_clamp_u16(s_sleep_capture.dropped_records),
+  };
   s_sleep_capture = (SleepCaptureState) {};
+
+  if (!system_task_add_callback(prv_finish_capture_dls_session, finish_data)) {
+    PBL_LOG_WRN("Unable to finish sleep capture logging session");
+    dls_finish(finish_data->session);
+    kernel_free(finish_data);
+  }
 }
 
 static void prv_start_capture(time_t now_utc) {
