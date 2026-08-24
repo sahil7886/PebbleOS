@@ -7,3 +7,4 @@
 
 //! Sends the battery measurement to all subscribed & connected devices.
 void bt_driver_bas_handle_update(uint8_t percent);
+void bt_driver_bas_handle_refresh(void);
