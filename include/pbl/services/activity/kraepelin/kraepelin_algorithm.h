@@ -3,7 +3,6 @@
 #include <stdbool.h>
 #include "util/time/time.h"
 
-
 // ---------------------------------------------------------------------------------------------
 // Equates
 // number of samples per second
@@ -51,12 +50,12 @@ typedef enum {
 
 // Sleep stats, returned by kalg_get_sleep_stats
 typedef struct {
-  time_t sleep_start_utc;     // start time of a recent sleep session. 0 if no session recently
-                              // detected, where "recent" means within the last
-                              // minimum_sleep_session_length minutes (currently 60).
-  uint16_t sleep_len_m;       // how many minutes of that sleep are *certain*, 0 if none.
-  time_t uncertain_start_utc; // start time of the uncertain area of the sleep session, which
-                              // always continues until the present time, 0 if none.
+  time_t sleep_start_utc;      // start time of a recent sleep session. 0 if no session recently
+                               // detected, where "recent" means within the last
+                               // minimum_sleep_session_length minutes (currently 60).
+  uint16_t sleep_len_m;        // how many minutes of that sleep are *certain*, 0 if none.
+  time_t uncertain_start_utc;  // start time of the uncertain area of the sleep session, which
+                               // always continues until the present time, 0 if none.
 } KAlgOngoingSleepStats;
 
 // Callback called by kalg_activities_update to register activity sessions.
@@ -132,6 +131,9 @@ uint32_t kalg_analyze_finish_epoch(KAlgState *state);
 //                       (caller passes "plugged into charger" OR'd with any other definite
 //                       not-worn hints such as a recent HRM off-wrist reading). Treated as a
 //                       hard "not worn" signal for sleep detection.
+// @param[in] heart_rate_elevated true when the minute-level HR state is above the user's elevated
+//                       threshold. This can keep an existing step activity alive, but cannot
+//                       start one by itself.
 // @param[in] resting_calories number of resting calories burned in the last minute
 // @param[in] active_calories number of active calories burned in the last minute
 // @param[in] distance_mm distance covered in millimeters in the last minute
@@ -139,9 +141,9 @@ uint32_t kalg_analyze_finish_epoch(KAlgState *state);
 //            session that it finds.
 // @param[in] context passed to the sessions_cb
 void kalg_activities_update(KAlgState *state, time_t utc_now, uint16_t steps, uint16_t vmc,
-                            uint8_t orientation, bool definitely_not_worn,
-                            uint32_t resting_calories,
-                            uint32_t active_calories, uint32_t distance_mm, bool shutting_down,
+                            uint8_t orientation, bool definitely_not_worn, bool heart_rate_elevated,
+                            uint32_t resting_calories, uint32_t active_calories,
+                            uint32_t distance_mm, bool shutting_down,
                             KAlgActivitySessionCallback sessions_cb, void *context);
 
 // Return the timestamp of the last minute that was processed for the given activity type
