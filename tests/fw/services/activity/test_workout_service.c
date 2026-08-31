@@ -5,11 +5,16 @@
 
 #include "pbl/services/activity/activity.h"
 #include "pbl/services/activity/activity_calculators.h"
+#include "pbl/services/activity/activity_private.h"
 #include "pbl/services/activity/workout_service.h"
 #include "pbl/services/hrm/hrm_manager.h"
+#include "pbl/services/system_task.h"
+#include "pbl/util/size.h"
 #include "process_management/app_install_types.h"
 #include "util/time/time.h"
 #include "util/units.h"
+
+#include <string.h>
 
 // ---------------------------------------------------------------------------------------
 #include "stubs_activity_insights.h"
@@ -88,22 +93,95 @@ AppInstallId app_get_app_id(void) {
 
 static bool s_hrm_subscribed;
 static uint32_t s_hrm_expiration;
+static HRMFeature s_hrm_features;
 HRMSessionRef sys_hrm_manager_app_subscribe(AppInstallId app_id, uint32_t update_interval_s,
                                             uint16_t expire_s, HRMFeature features) {
   s_hrm_subscribed = true;
   s_hrm_expiration = expire_s;
+  s_hrm_features = features;
   return 1;
 }
 
 bool sys_hrm_manager_unsubscribe(HRMSessionRef ref) {
   s_hrm_subscribed = false;
   s_hrm_expiration = 0;
+  s_hrm_features = (HRMFeature)0;
   return true;
 }
 
 bool sys_hrm_manager_set_update_interval(HRMSessionRef session, uint32_t update_interval_s,
                                          uint16_t expire_s) {
   s_hrm_expiration = expire_s;
+  return true;
+}
+
+// ---------------------------------------------------------------------------------------
+
+typedef enum {
+  DataLoggingSession_WorkoutHeartRate = 1,
+  DataLoggingSession_WorkoutPpi = 2,
+} DataLoggingSessionId;
+
+static bool s_hr_dls_active;
+static bool s_ppi_dls_active;
+static WorkoutHeartRateDataLoggingRecord s_hr_dls_records[32];
+static WorkoutPpiDataLoggingRecord s_ppi_dls_records[32];
+static size_t s_num_hr_dls_records;
+static size_t s_num_ppi_dls_records;
+
+DataLoggingSession *dls_create(uint32_t tag, DataLoggingItemType item_type, uint16_t item_size,
+                               bool buffered, bool resume, const Uuid *uuid) {
+  cl_assert_equal_i(item_type, DATA_LOGGING_BYTE_ARRAY);
+  cl_assert_equal_b(buffered, true);
+  cl_assert_equal_b(resume, false);
+
+  if (tag == DlsSystemTagWorkoutHeartRate) {
+    cl_assert_equal_i(item_size, sizeof(WorkoutHeartRateDataLoggingRecord));
+    s_hr_dls_active = true;
+    return (DataLoggingSession *)DataLoggingSession_WorkoutHeartRate;
+  }
+  if (tag == DlsSystemTagWorkoutPpi) {
+    cl_assert_equal_i(item_size, sizeof(WorkoutPpiDataLoggingRecord));
+    s_ppi_dls_active = true;
+    return (DataLoggingSession *)DataLoggingSession_WorkoutPpi;
+  }
+  return NULL;
+}
+
+DataLoggingResult dls_log(DataLoggingSession *session, const void *data, uint32_t num_items) {
+  cl_assert_equal_i(num_items, 1);
+
+  if (session == (DataLoggingSession *)DataLoggingSession_WorkoutHeartRate) {
+    cl_assert(s_hr_dls_active);
+    cl_assert(s_num_hr_dls_records < ARRAY_LENGTH(s_hr_dls_records));
+    memcpy(&s_hr_dls_records[s_num_hr_dls_records++], data,
+           sizeof(WorkoutHeartRateDataLoggingRecord));
+    return DATA_LOGGING_SUCCESS;
+  }
+  if (session == (DataLoggingSession *)DataLoggingSession_WorkoutPpi) {
+    cl_assert(s_ppi_dls_active);
+    cl_assert(s_num_ppi_dls_records < ARRAY_LENGTH(s_ppi_dls_records));
+    memcpy(&s_ppi_dls_records[s_num_ppi_dls_records++], data,
+           sizeof(WorkoutPpiDataLoggingRecord));
+    return DATA_LOGGING_SUCCESS;
+  }
+  return DATA_LOGGING_INVALID_PARAMS;
+}
+
+void dls_finish(DataLoggingSession *session) {
+  if (session == (DataLoggingSession *)DataLoggingSession_WorkoutHeartRate) {
+    cl_assert(s_hr_dls_active);
+    s_hr_dls_active = false;
+  } else if (session == (DataLoggingSession *)DataLoggingSession_WorkoutPpi) {
+    cl_assert(s_ppi_dls_active);
+    s_ppi_dls_active = false;
+  } else {
+    cl_assert(false);
+  }
+}
+
+bool system_task_add_callback(SystemTaskEventCallback cb, void *data) {
+  cb(data);
   return true;
 }
 
@@ -156,6 +234,24 @@ static void prv_put_bpm_event(int bpm, HRMQuality quality) {
   workout_service_health_event_handler(&event.health_event);
 }
 
+#ifdef CONFIG_HRM_HRV
+static void prv_put_ppi_event(uint16_t ppi_ms, HRMQuality quality) {
+  PebbleEvent event = {
+    .type = PEBBLE_HEALTH_SERVICE_EVENT,
+    .health_event = {
+      .type = HealthEventHRVUpdate,
+      .data.hrv_update = {
+        .ppi_ms = ppi_ms,
+        .quality = quality,
+      },
+    },
+  };
+  event_put(&event);
+
+  workout_service_health_event_handler(&event.health_event);
+}
+#endif
+
 static void prv_inc_time(int seconds) {
   fake_rtc_increment_time(seconds);
   prv_workout_timer_cb(NULL);
@@ -172,6 +268,11 @@ void test_workout_service__initialize(void) {
   s_hrm_expiration = 0;
   s_hrm_subscribed = false;
   s_hrm_measurement_interval = HRMonitoringInterval_10Min;
+  s_hrm_features = (HRMFeature)0;
+  s_hr_dls_active = false;
+  s_ppi_dls_active = false;
+  s_num_hr_dls_records = 0;
+  s_num_ppi_dls_records = 0;
   s_abandoned_workout_notification_sent = false;
 
   const bool assert_all_unlocked = true;
@@ -515,13 +616,89 @@ void test_workout_service__app_open_close_active_workout(void) {
   workout_service_frontend_opened();
   cl_assert_equal_b(s_hrm_subscribed, true);
   cl_assert_equal_i(s_hrm_expiration, 0);
+  cl_assert_equal_i(s_hrm_features, HRMFeature_BPM);
 
   cl_assert(workout_service_start_workout(ActivitySessionType_Run));
+  cl_assert_equal_i(s_hrm_features, HRMFeature_BPM);
 
   workout_service_frontend_closed();
   cl_assert_equal_b(s_hrm_subscribed, true);
   cl_assert_equal_i(s_hrm_expiration, SECONDS_PER_HOUR);
+  cl_assert_equal_i(s_hrm_features, HRMFeature_BPM);
 }
+
+// ---------------------------------------------------------------------------------------
+// Workout telemetry must copy the BPM stream without changing or narrowing its range.
+void test_workout_service__high_heart_rate_is_preserved_in_live_and_logged_data(void) {
+  workout_service_frontend_opened();
+  cl_assert_equal_i(s_hrm_features, HRMFeature_BPM);
+  cl_assert(workout_service_start_workout(ActivitySessionType_Run));
+
+  const uint8_t bpm_samples[] = {160, 190, 200};
+  for (size_t i = 0; i < ARRAY_LENGTH(bpm_samples); ++i) {
+    prv_inc_time(1);
+    prv_put_bpm_event(bpm_samples[i], HRMQuality_Good);
+  }
+
+  int32_t current_bpm;
+  cl_assert(workout_service_get_current_workout_info(NULL, NULL, NULL, &current_bpm, NULL));
+  cl_assert_equal_i(current_bpm, 200);
+
+  int32_t avg_bpm;
+  cl_assert(workout_service_get_avg_hr(&avg_bpm));
+  cl_assert_equal_i(avg_bpm, 183);
+
+  cl_assert_equal_i(s_num_hr_dls_records, ARRAY_LENGTH(bpm_samples));
+  for (size_t i = 0; i < ARRAY_LENGTH(bpm_samples); ++i) {
+    cl_assert_equal_i(s_hr_dls_records[i].sequence, i);
+    cl_assert_equal_i(s_hr_dls_records[i].bpm, bpm_samples[i]);
+    cl_assert_equal_i(s_hr_dls_records[i].quality, HRMQuality_Good);
+    cl_assert_equal_i(s_hr_dls_records[i].flags, WORKOUT_HEART_RATE_FLAG_ACTIVE);
+    cl_assert_equal_i(s_hr_dls_records[i].version, WORKOUT_HEART_RATE_LOGGING_VERSION);
+  }
+
+  cl_assert(workout_service_stop_workout());
+  cl_assert_equal_i(s_num_hr_dls_records, ARRAY_LENGTH(bpm_samples) + 1);
+  const WorkoutHeartRateDataLoggingRecord *completion =
+      &s_hr_dls_records[ARRAY_LENGTH(bpm_samples)];
+  cl_assert_equal_i(completion->sequence, ARRAY_LENGTH(bpm_samples));
+  cl_assert_equal_i(completion->flags, WORKOUT_HEART_RATE_FLAG_COMPLETE);
+  cl_assert_equal_i(completion->version, WORKOUT_HEART_RATE_LOGGING_VERSION);
+  cl_assert_equal_b(s_hr_dls_active, false);
+}
+
+#ifdef CONFIG_HRM_HRV
+// ---------------------------------------------------------------------------------------
+// If another client has enabled HRV, retain its PPI events without changing Workout's BPM-only
+// sensor request.
+void test_workout_service__ppi_logging_is_observational(void) {
+  workout_service_frontend_opened();
+  cl_assert(workout_service_start_workout(ActivitySessionType_Run));
+  cl_assert_equal_i(s_hrm_features, HRMFeature_BPM);
+
+  prv_put_ppi_event(375, HRMQuality_Excellent);
+  prv_inc_time(1);
+  prv_put_ppi_event(400, HRMQuality_Good);
+
+  cl_assert_equal_i(s_hrm_features, HRMFeature_BPM);
+  cl_assert_equal_i(s_num_ppi_dls_records, 2);
+  cl_assert_equal_i(s_ppi_dls_records[0].sequence, 0);
+  cl_assert_equal_i(s_ppi_dls_records[0].ppi_ms, 375);
+  cl_assert_equal_i(s_ppi_dls_records[1].sequence, 1);
+  cl_assert_equal_i(s_ppi_dls_records[1].ppi_ms, 400);
+  cl_assert_equal_i(s_ppi_dls_records[1].flags_and_version,
+                    (WORKOUT_PPI_LOGGING_VERSION << WORKOUT_PPI_VERSION_SHIFT) |
+                        WORKOUT_PPI_FLAG_ACTIVE);
+
+  cl_assert(workout_service_stop_workout());
+  cl_assert_equal_i(s_num_ppi_dls_records, 3);
+  cl_assert_equal_i(s_ppi_dls_records[2].sequence, 2);
+  cl_assert_equal_i(s_ppi_dls_records[2].flags_and_version,
+                    (WORKOUT_PPI_LOGGING_VERSION << WORKOUT_PPI_VERSION_SHIFT) |
+                        WORKOUT_PPI_FLAG_COMPLETE);
+  cl_assert_equal_b(s_ppi_dls_active, false);
+}
+#endif
 
 // ---------------------------------------------------------------------------------------
 // Open the app, start a workout, 30s, stop the workout. Make sure the HR turns off instantly

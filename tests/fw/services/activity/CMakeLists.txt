@@ -108,7 +108,7 @@ pbl_clar_test(test_workout_service
     src/fw/services/activity/workout_service.c
     tests/fakes/fake_events.c
     tests/fakes/fake_rtc.c
-  DEFINES CONFIG_HRM
+  DEFINES CONFIG_HRM CONFIG_HRM_HRV
   OVERRIDES dummy_board
 )
 

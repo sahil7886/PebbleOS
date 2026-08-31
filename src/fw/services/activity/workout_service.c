@@ -493,6 +493,7 @@ void workout_service_frontend_opened(void) {
   prv_lock();
   {
 #ifdef CONFIG_HRM
+    // Concurrent HRV reconfigures the shared PPG path and degrades BPM accuracy under motion.
     s_workout_data.hrm_session =
         sys_hrm_manager_app_subscribe(app_get_app_id(), 1, 0, HRMFeature_BPM);
 #endif // CONFIG_HRM
@@ -536,15 +537,9 @@ void workout_service_frontend_closed(void) {
     }
 
     if (hr_time_left > 0) {
-      // Still some time left. Set a subscription with an expiration
+      // Preserve the BPM-only sensor mode while the Workout continues in the background.
       s_workout_data.hrm_session = sys_hrm_manager_app_subscribe(
-          app_get_app_id(), 1, hr_time_left,
-#ifdef CONFIG_HRM_HRV
-          workout_service_is_workout_ongoing() ? (HRMFeature_BPM | HRMFeature_HRV) : HRMFeature_BPM
-#else
-          HRMFeature_BPM
-#endif
-      );
+          app_get_app_id(), 1, hr_time_left, HRMFeature_BPM);
     } else {
       // No time left. Kill the subscription
       sys_hrm_manager_unsubscribe(s_workout_data.hrm_session);
@@ -603,17 +598,6 @@ bool workout_service_start_workout(ActivitySessionType type) {
     s_workout_data.current_workout->last_movement_event_time_ts = time_get_uptime_seconds();
 
     regular_timer_add_seconds_callback(&s_workout_data.second_timer);
-
-#ifdef CONFIG_HRM
-    // A normal Workout begins with the existing one-second BPM subscription. Add HRV only while
-    // the user is actively recording: this causes the optional Time 2 driver path to run and
-    // stops it again on Workout end, without changing idle or merely-open Workout battery use.
-    if (s_workout_data.hrm_session != HRM_INVALID_SESSION_REF) {
-#ifdef CONFIG_HRM_HRV
-      sys_hrm_manager_set_features(s_workout_data.hrm_session, HRMFeature_BPM | HRMFeature_HRV);
-#endif
-    }
-#endif
 
     // Finally tell our algorithm it should stop automatically tracking activities
     activity_algorithm_enable_activity_tracking(false /* disable */);
@@ -720,10 +704,6 @@ bool workout_service_stop_workout(void) {
     // the user's preferred rate within a bounded window, regardless of when the app actually exits.
     sys_hrm_manager_set_update_interval(s_workout_data.hrm_session, 1,
                                         WORKOUT_ENDED_HR_SUBSCRIPTION_TS_EXPIRE);
-#ifdef CONFIG_HRM_HRV
-    // Return to the existing BPM-only recovery behavior before releasing the Workout state.
-    sys_hrm_manager_set_features(s_workout_data.hrm_session, HRMFeature_BPM);
-#endif
 #endif // CONFIG_HRM
 
     PBL_LOG_INFO("Stopping a workout with type: %d", wrkt->type);
