@@ -50,6 +50,7 @@
 
 // Globals
 AccelSamplingRate s_sample_rate;
+static ActivityState s_activity_state;
 
 static bool s_dls_created;
 static DataLoggingSession *s_dls_session = (DataLoggingSession *)1;
@@ -94,6 +95,10 @@ void kalg_enable_activity_tracking(KAlgState *kalg_state, bool enable) {}
 
 bool activity_tracking_on(void) {
   return true;
+}
+
+ActivityState *activity_private_state(void) {
+  return &s_activity_state;
 }
 
 // ------------------------------------------------------------------------------------
@@ -376,6 +381,8 @@ static void prv_feed_minute_data(uint32_t num_minutes, AlgMinuteDLSSample *minut
 void test_activity_algorithm_kraepelin__initialize(void) {
   time_t utc_sec = mktime(&s_start_time_tm);
   fake_rtc_init(100 /*initial_ticks*/, utc_sec);
+
+  memset(&s_activity_state, 0, sizeof(s_activity_state));
 
   fake_spi_flash_init(0, 0x1000000);
   pfs_init(false);

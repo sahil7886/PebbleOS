@@ -24,6 +24,8 @@
 
 #include "pbl/kernel/mutex.h"
 
+#include <stdint.h>
+
 PBL_LOG_MODULE_DECLARE(service_activity, CONFIG_SERVICE_ACTIVITY_LOG_LEVEL);
 
 #define WORKOUT_HR_READING_TS_EXPIRE (SECONDS_PER_MINUTE)
@@ -35,6 +37,7 @@ PBL_LOG_MODULE_DECLARE(service_activity, CONFIG_SERVICE_ACTIVITY_LOG_LEVEL);
 //! Allocated when a Workout is started
 typedef struct CurrentWorkoutData {
   ActivitySessionType type;
+  uint32_t id;
 
   time_t start_utc;
   time_t last_paused_utc;
@@ -70,7 +73,8 @@ typedef struct CurrentWorkoutData {
   // Whether or not the current workout is paused
   bool paused;
 
-  EventedTimerID workout_abandoned_timer;
+  EventedTimerID workout_abandoned_notification_timer;
+  EventedTimerID workout_abandon_workout_timer;
 } CurrentWorkoutData;
 
 //! Persisted statically in RAM
@@ -80,6 +84,7 @@ typedef struct WorkoutServiceData {
   time_t last_workout_end_ts;
   time_t frontend_last_opened_ts;
   HRMSessionRef hrm_session;
+  uint32_t next_workout_id;
 
   CurrentWorkoutData *current_workout;
 } WorkoutServiceData;
@@ -107,6 +112,15 @@ static void prv_lock(void) {
 static void prv_unlock(void) {
   pbl_mutex_unlock(&s_workout_data.s_workout_mutex);
 }
+
+static void prv_cancel_abandoned_workout_timers(CurrentWorkoutData *workout) {
+  evented_timer_cancel(workout->workout_abandoned_notification_timer);
+  evented_timer_cancel(workout->workout_abandon_workout_timer);
+  workout->workout_abandoned_notification_timer = EVENTED_TIMER_INVALID_ID;
+  workout->workout_abandon_workout_timer = EVENTED_TIMER_INVALID_ID;
+}
+
+static bool prv_stop_workout(uint32_t expected_workout_id);
 
 static void prv_put_event(PebbleWorkoutEventType e_type) {
   PebbleEvent event = {
@@ -396,17 +410,41 @@ bool workout_service_is_workout_type_supported(ActivitySessionType type) {
 }
 
 // ---------------------------------------------------------------------------------------
-T_STATIC void prv_abandon_workout_timer_callback(void *unused) {
-  workout_service_stop_workout();
+T_STATIC void prv_abandon_workout_timer_callback(void *data) {
+  const uint32_t workout_id = (uint32_t)(uintptr_t)data;
+
+  prv_lock();
+  {
+    if (s_workout_data.current_workout && s_workout_data.current_workout->id == workout_id) {
+      s_workout_data.current_workout->workout_abandon_workout_timer = EVENTED_TIMER_INVALID_ID;
+    }
+  }
+  prv_unlock();
+
+  prv_stop_workout(workout_id);
 }
 
 // ---------------------------------------------------------------------------------------
-T_STATIC void prv_abandoned_notification_timer_callback(void *unused) {
-  workout_utils_send_abandoned_workout_notification();
+T_STATIC void prv_abandoned_notification_timer_callback(void *data) {
+  const uint32_t workout_id = (uint32_t)(uintptr_t)data;
+  bool has_active_workout = false;
+  prv_lock();
+  {
+    // A timer callback can have been queued just as the original workout stopped. Do not let a
+    // stale callback affect a newer workout that happens to be active when it is delivered.
+    if (s_workout_data.current_workout && s_workout_data.current_workout->id == workout_id) {
+      s_workout_data.current_workout->workout_abandoned_notification_timer =
+          EVENTED_TIMER_INVALID_ID;
+      s_workout_data.current_workout->workout_abandon_workout_timer = evented_timer_register(
+          WORKOUT_ABANDON_WORKOUT_TIMEOUT_MS, false, prv_abandon_workout_timer_callback, data);
+      has_active_workout = true;
+    }
+  }
+  prv_unlock();
 
-  s_workout_data.current_workout->workout_abandoned_timer =
-      evented_timer_register(WORKOUT_ABANDON_WORKOUT_TIMEOUT_MS, false,
-                             prv_abandon_workout_timer_callback, NULL);
+  if (has_active_workout) {
+    workout_utils_send_abandoned_workout_notification();
+  }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -470,11 +508,12 @@ void workout_service_workout_event_handler(PebbleWorkoutEvent *event) {
     }
     // Handling this with an event because the timer needs to be called from KernelMain
     if (event->type == PebbleWorkoutEvent_FrontendOpened) {
-      evented_timer_cancel(s_workout_data.current_workout->workout_abandoned_timer);
+      prv_cancel_abandoned_workout_timers(s_workout_data.current_workout);
     } else if (event->type == PebbleWorkoutEvent_FrontendClosed) {
-      s_workout_data.current_workout->workout_abandoned_timer =
-          evented_timer_register(WORKOUT_ABANDONED_NOTIFICATION_TIMEOUT_MS, false,
-                                 prv_abandoned_notification_timer_callback, NULL);
+      prv_cancel_abandoned_workout_timers(s_workout_data.current_workout);
+      s_workout_data.current_workout->workout_abandoned_notification_timer = evented_timer_register(
+          WORKOUT_ABANDONED_NOTIFICATION_TIMEOUT_MS, false, prv_abandoned_notification_timer_callback,
+          (void *)(uintptr_t)s_workout_data.current_workout->id);
     }
   }
 unlock:
@@ -584,6 +623,10 @@ bool workout_service_start_workout(ActivitySessionType type) {
 
     s_workout_data.current_workout = kernel_zalloc_check(sizeof(CurrentWorkoutData));
     s_workout_data.current_workout->type = type;
+    if (++s_workout_data.next_workout_id == 0) {
+      ++s_workout_data.next_workout_id;
+    }
+    s_workout_data.current_workout->id = s_workout_data.next_workout_id;
     s_workout_data.current_workout->start_utc = rtc_get_time();
     s_workout_data.current_workout->current_bpm_timestamp_ts = time_get_uptime_seconds();
     // FIXME: This probably doesn't need to be on a timer. We can just flush out a new time on each
@@ -650,7 +693,7 @@ unlock:
 }
 
 // ---------------------------------------------------------------------------------------
-bool workout_service_stop_workout(void) {
+static bool prv_stop_workout(uint32_t expected_workout_id) {
   bool save_session = false;
   ActivitySession session_to_save;
   int32_t avg_hr_to_save = 0;
@@ -660,13 +703,20 @@ bool workout_service_stop_workout(void) {
 
   prv_lock();
   {
-    if (!workout_service_is_workout_ongoing()) {
-      PBL_LOG_WRN("No workout in progress");
+    if (!s_workout_data.current_workout ||
+        (expected_workout_id && s_workout_data.current_workout->id != expected_workout_id)) {
+      if (!expected_workout_id) {
+        PBL_LOG_WRN("No workout in progress");
+      }
       prv_unlock();
       return false;
     }
 
     CurrentWorkoutData *wrkt = s_workout_data.current_workout;
+
+    // Both timers can be queued after the Workout UI is closed. Cancel them before the workout
+    // state is released so neither can affect a session the user already ended.
+    prv_cancel_abandoned_workout_timers(wrkt);
 
     // Snapshot the session data so we can persist it after dropping the
     // workout mutex. activity_insights_push_activity_session_notification
@@ -755,6 +805,11 @@ bool workout_service_stop_workout(void) {
   }
 
   return true;
+}
+
+// ---------------------------------------------------------------------------------------
+bool workout_service_stop_workout(void) {
+  return prv_stop_workout(0 /* any current workout */);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -888,6 +943,7 @@ void workout_service_get_active_kcalories(int32_t *active) {
 
 void workout_service_reset(void) {
   if (s_workout_data.current_workout) {
+    prv_cancel_abandoned_workout_timers(s_workout_data.current_workout);
     kernel_free(s_workout_data.current_workout);
   }
   s_workout_data = (WorkoutServiceData) {};

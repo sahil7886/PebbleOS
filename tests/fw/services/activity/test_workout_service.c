@@ -34,6 +34,8 @@ extern bool workout_service_get_current_workout_hr_zone_time(int32_t *hr_zone_ti
 extern void workout_service_get_active_kcalories(int32_t *active);
 extern void workout_service_reset(void);
 
+#define FIRST_WORKOUT_TIMER_DATA ((void *)(uintptr_t)1)
+
 // Stubs
 ///////////////////////////////////////////////////////////
 
@@ -974,7 +976,7 @@ void test_workout_service__avg_hr(void) {
 }
 
 // ---------------------------------------------------------------------------------------
-// Open the app, start a workout, close app.
+// Open the app, start a workout, close the app.
 // 55 min - Make sure the notification was sent.
 // 60 min - Make sure the workout was ended.
 void test_workout_service__abandon_workout(void) {
@@ -999,11 +1001,36 @@ void test_workout_service__abandon_workout(void) {
 
   // Wait 25 minutes, call evented timer callback and make sure the notification is sent
   prv_inc_time(25 * SECONDS_PER_MINUTE);
-  prv_abandoned_notification_timer_callback(NULL);
+  prv_abandoned_notification_timer_callback(FIRST_WORKOUT_TIMER_DATA);
   cl_assert_equal_b(s_abandoned_workout_notification_sent, true);
 
-  // Wait 5 minutes, call evented timer callback and make sure the workout was ended
+  // Wait five minutes, call evented timer callback and make sure the workout was ended.
   prv_inc_time(5 * SECONDS_PER_MINUTE);
-  prv_abandon_workout_timer_callback(NULL);
+  prv_abandon_workout_timer_callback(FIRST_WORKOUT_TIMER_DATA);
   cl_assert_equal_b(workout_service_is_workout_ongoing(), false);
+}
+
+// ---------------------------------------------------------------------------------------
+void test_workout_service__abandoned_notification_ignores_stopped_workout(void) {
+  cl_assert(workout_service_start_workout(ActivitySessionType_Run));
+  cl_assert(workout_service_stop_workout());
+
+  prv_abandoned_notification_timer_callback(FIRST_WORKOUT_TIMER_DATA);
+  cl_assert_equal_b(s_abandoned_workout_notification_sent, false);
+}
+
+// ---------------------------------------------------------------------------------------
+void test_workout_service__stale_abandoned_timers_do_not_affect_new_workout(void) {
+  // Workout IDs start at 1 after workout_service_reset() in the test initializer.
+  cl_assert(workout_service_start_workout(ActivitySessionType_Run));
+  cl_assert(workout_service_stop_workout());
+
+  cl_assert(workout_service_start_workout(ActivitySessionType_Run));
+
+  // Simulate both callbacks for the first, already-ended workout arriving while the second
+  // workout is active. Neither may notify about nor end the new workout.
+  prv_abandoned_notification_timer_callback(FIRST_WORKOUT_TIMER_DATA);
+  cl_assert_equal_b(s_abandoned_workout_notification_sent, false);
+  prv_abandon_workout_timer_callback(FIRST_WORKOUT_TIMER_DATA);
+  cl_assert_equal_b(workout_service_is_workout_ongoing(), true);
 }
