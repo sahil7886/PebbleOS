@@ -37,6 +37,9 @@ typedef enum {
   // High-resolution sleep-capture records. One compact, versioned stream carries accepted PPI,
   // BPM/quality, 30-second motion summaries, and session completion diagnostics.
   DlsSystemTagSleepCapture = 90,
+  // Version 2 widens the sleep-capture sequence number to retain a full high-rate night.
+  // Tag 90 remains readable by older companions and must keep its original 14-byte layout.
+  DlsSystemTagSleepCaptureV2 = 91,
 } DlsSystemTag;
 
 //! Init the data logging service. Called by the system at boot time.

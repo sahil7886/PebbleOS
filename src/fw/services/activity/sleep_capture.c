@@ -34,16 +34,16 @@ typedef enum {
 // One resumable DataLogging stream for a complete night.
 typedef struct PACKED {
   uint32_t session_id;
-  uint16_t sequence;
+  uint32_t sequence;
   uint32_t timestamp_utc;
   uint16_t value;
   int8_t quality;
   uint8_t type_flags;
 } SleepCaptureDataLoggingRecord;
-_Static_assert(sizeof(SleepCaptureDataLoggingRecord) == 14,
+_Static_assert(sizeof(SleepCaptureDataLoggingRecord) == 16,
                "Sleep capture DataLogging record must remain wire-compatible");
 
-#define SLEEP_CAPTURE_LOGGING_VERSION 1
+#define SLEEP_CAPTURE_LOGGING_VERSION 2
 #define SLEEP_CAPTURE_TYPE_MASK 0x07
 #define SLEEP_CAPTURE_FLAG_COMPLETE (1 << 3)
 #define SLEEP_CAPTURE_FLAG_DROPPED (1 << 4)
@@ -72,7 +72,7 @@ typedef struct {
 typedef struct {
   DataLoggingSession *session;
   uint32_t session_id;
-  uint16_t sequence;
+  uint32_t sequence;
   time_t end_utc;
   uint16_t dropped_records;
   bool terminal_record_queued;
@@ -112,7 +112,10 @@ static bool prv_log_record(SleepCaptureRecordType type, time_t timestamp_utc, ui
     ++s_sleep_capture.dropped_records;
     return false;
   }
-  if (s_sleep_capture.next_sequence > UINT16_MAX) {
+  // Reserve UINT32_MAX for the terminal completion marker if a capture ever reaches this
+  // theoretical limit. The old 16-bit layout could exhaust during a high-rate overnight PPI
+  // stream; version 2's 32-bit sequence cannot under normal use.
+  if (s_sleep_capture.next_sequence >= UINT32_MAX) {
     ++s_sleep_capture.dropped_records;
     s_sleep_capture.storage_full = true;
     if (!s_sleep_capture.reported_log_error) {
@@ -125,7 +128,7 @@ static bool prv_log_record(SleepCaptureRecordType type, time_t timestamp_utc, ui
   SleepCaptureDataLoggingRecord record = {
     .session_id = s_sleep_capture.session_id,
     // Leave sequence gaps visible when a write fails.
-    .sequence = (uint16_t)s_sleep_capture.next_sequence++,
+    .sequence = s_sleep_capture.next_sequence++,
     .timestamp_utc = (uint32_t)timestamp_utc,
     .value = value,
     .quality = quality,
@@ -219,7 +222,7 @@ static void prv_finish_capture(time_t now_utc) {
   *finish_data = (SleepCaptureDlsFinishData) {
     .session = s_sleep_capture.dls_session,
     .session_id = s_sleep_capture.session_id,
-    .sequence = (uint16_t)s_sleep_capture.next_sequence,
+    .sequence = s_sleep_capture.next_sequence,
     .end_utc = now_utc,
     .dropped_records = prv_clamp_u16(s_sleep_capture.dropped_records),
   };
@@ -235,7 +238,7 @@ static void prv_finish_capture(time_t now_utc) {
 static void prv_start_capture(time_t now_utc) {
   const Uuid system_uuid = UUID_SYSTEM;
   // Resume the flash stream after a reboot.
-  DataLoggingSession *session = dls_create(DlsSystemTagSleepCapture, DATA_LOGGING_BYTE_ARRAY,
+  DataLoggingSession *session = dls_create(DlsSystemTagSleepCaptureV2, DATA_LOGGING_BYTE_ARRAY,
                                            sizeof(SleepCaptureDataLoggingRecord),
                                            true /* buffered */, true /* resume */, &system_uuid);
   if (!session) {
