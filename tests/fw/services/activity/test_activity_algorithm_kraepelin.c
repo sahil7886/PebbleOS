@@ -233,14 +233,6 @@ void activity_metrics_prv_reset_hr_stats(void) {
   s_activity_next_heart_rate_zone = 0;
 }
 
-void activity_metrics_prv_set_hrm_worn_status(time_t now_utc, bool is_offwrist) {
-}
-
-bool activity_metrics_prv_is_hrm_offwrist(time_t now_utc) {
-  return false;
-}
-
-
 // =============================================================================================
 // Algorithm stubs
 uint32_t kalg_state_size(void) {
@@ -951,5 +943,4 @@ void test_activity_algorithm_kraepelin__minute_data_steps_during_sleep(void) {
     cl_assert_equal_i(retrieve[i].heart_rate_bpm, minute_data[i].heart_rate_bpm);
   }
 }
-
 
