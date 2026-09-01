@@ -280,6 +280,19 @@ bool protobuf_log_hr_add_sample(ProtobufLogRef ref, time_t now_utc, uint8_t bpm,
   return true;
 }
 
+void sleep_capture_minute_handler(uint32_t utc_sec, bool heart_rate_enabled, bool sleep_active,
+                                  bool enhanced_logging_enabled) {}
+
+bool sleep_capture_is_active(void) {
+  return false;
+}
+
+void sleep_capture_handle_hrm_event(const PebbleHRMEvent *event) {}
+
+void sleep_capture_handle_accel(const AccelRawData *data, uint32_t num_samples) {}
+
+void sleep_capture_deinit(void) {}
+
 // =============================================================================================
 // Assertion utilities
 // --------------------------------------------------------------------------------------
