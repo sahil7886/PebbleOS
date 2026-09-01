@@ -2481,11 +2481,16 @@ void test_activity__hrm_ignore(void) {
   prv_advance_time_hr(1 /*sec*/, 120 /*hr*/, HRMQuality_Good, true /*force_continuous*/);
   cl_assert_equal_i(s_num_hr_events, 1);
 
+  activity_metrics_prv_reset_hr_stats();
+
   // Should fire off an event. OffWrist, tell clients
   prv_advance_time_hr(1 /*sec*/, 120 /*hr*/, HRMQuality_OffWrist, true /*force_continuous*/);
   cl_assert_equal_i(s_num_hr_events, 2);
   cl_assert_equal_i(s_last_hr_event.data.heart_rate_update.current_bpm, 0);
   cl_assert_equal_i(s_last_hr_event.data.heart_rate_update.quality, HRMQuality_OffWrist);
+  activity_metrics_prv_get_median_hr_bpm(&median, &total_weight);
+  cl_assert_equal_i(median, 0);
+  cl_assert_equal_i(total_weight, 0);
 
   // Should fire off an event. OffWrist, tell clients
   prv_advance_time_hr(1 /*sec*/, 0 /*hr*/, HRMQuality_OffWrist, true /*force_continuous*/);

@@ -161,7 +161,7 @@ T_STATIC void prv_hrm_subscription_cb(PebbleHRMEvent *hrm_event, void *context) 
     // Perform a basic validity check so we only proceed with reasonable data
     // TODO: Use quality to filter out some readings,
     // TODO PBL-40784: Use HRMQuality_OffWrist as a special case to slow down the HRM subscription
-    bool valid_hr_reading = true;
+    bool valid_hr_reading = hrm_event->bpm.quality != HRMQuality_OffWrist;
     if (hrm_event->bpm.bpm < ACTIVITY_DEFAULT_MIN_HR ||
         hrm_event->bpm.bpm > ACTIVITY_DEFAULT_MAX_HR) {
       valid_hr_reading = false;
@@ -169,11 +169,6 @@ T_STATIC void prv_hrm_subscription_cb(PebbleHRMEvent *hrm_event, void *context) 
 
     uint32_t now_uptime_ts = time_get_uptime_seconds();
     time_t now_utc = rtc_get_time();
-
-    // Cache the worn-status from this event so sleep tracking can use it as a strong off-wrist
-    // signal (PPG off-wrist detection is far more reliable than the accel-only heuristics).
-    activity_metrics_prv_set_hrm_worn_status(
-        now_utc, hrm_event->bpm.quality == HRMQuality_OffWrist);
 
     if (valid_hr_reading) {
       // Update the heart rate metrics
