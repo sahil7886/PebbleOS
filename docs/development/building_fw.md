@@ -48,6 +48,51 @@ The resulting `.pbz` file will be located in the `build/` directory. Transfer th
 to the device paired to your watch, then, in the Pebble app, enable `Settings -> Show debug options`.
 Go back to the Devices tab, tap your watch, then `Firmware Update Debug -> Sideload FW`, and select the `.pbz` file.
 
+### Dual-slot watches
+
+For a watch using pblboot's dual-slot firmware, build for the slot that is not currently
+running. The watch information reported by the mobile app includes `isSlot0`. If it is
+`true`, target slot 1; otherwise, target slot 0. Reusing the active slot produces a bundle
+the updater cannot install.
+
+```shell
+PEBBLE_TARGET_SLOT=1
+./pbl configure --board obelix@pvt -DCONFIG_RELEASE=y \
+    -DCONFIG_FIRMWARE_SLOT=$PEBBLE_TARGET_SLOT
+./pbl build
+./pbl bundle
+```
+
+Confirm that the generated filename ends in `_slot${PEBBLE_TARGET_SLOT}.pbz` and that the
+same slot is recorded in `manifest.json` before sideloading it. After a successful update,
+the running slot changes, so alternate the target slot for the next update.
+
+For an iPhone connected to a development Mac, the bundle can be placed in the companion
+app's container and opened through the normal sideload confirmation flow:
+
+```shell
+PEBBLE_IOS_DEVICE=DEVICE_ID
+PEBBLE_IOS_BUNDLE=com.example.pebble
+PEBBLE_PBZ=build/normal_obelix_pvt_version_slot1.pbz
+
+xcrun devicectl device copy to --device $PEBBLE_IOS_DEVICE \
+    --domain-type appDataContainer --domain-identifier $PEBBLE_IOS_BUNDLE \
+    --destination tmp/firmware.pbz --source $PEBBLE_PBZ
+```
+
+Use the absolute on-device path printed by that command as a `file://` URL:
+
+```shell
+xcrun devicectl device process launch --device $PEBBLE_IOS_DEVICE \
+    --terminate-existing --payload-url file:///private/var/mobile/Containers/Data/Application/APP_ID/tmp/firmware.pbz \
+    $PEBBLE_IOS_BUNDLE
+```
+
+Approve the firmware sideload in the app and keep both phone and watch nearby until the
+watch reboots. This is an OTA update; `./pbl flash` is for a firmware development kit whose
+target has been placed in the chip's download mode. A visible serial port alone does not
+mean a sealed watch is ready for direct flashing.
+
 On Android, flashing repeatedly is better scripted over adb, which installs without asking. This route
 is open to an adb shell, which holds the `android.permission.DUMP` the broadcast requires,
 and it needs `Show debug options` on in the app. `$PBZ` is the file from `build/`:
