@@ -202,10 +202,14 @@ static ActivityRawSamplesRecord s_dls_accel_records[100];
 static bool s_dls_activity_sessions_created;
 static int s_num_dls_activity_records;
 static ActivitySessionDataLoggingRecord s_dls_activity_records[100];
+static int s_dls_activity_create_failures_remaining;
+static int s_dls_activity_log_failures_remaining;
 
 static void prv_reset_captured_dls_data(void) {
   s_num_dls_accel_records = 0;
   s_num_dls_activity_records = 0;
+  s_dls_activity_create_failures_remaining = 0;
+  s_dls_activity_log_failures_remaining = 0;
 }
 
 DataLoggingResult dls_log(DataLoggingSession *logging_session, const void *data,
@@ -221,6 +225,10 @@ DataLoggingResult dls_log(DataLoggingSession *logging_session, const void *data,
 
   } else if (logging_session == (DataLoggingSession *)DataLoggingSession_ActivitySessions) {
     cl_assert(s_dls_activity_sessions_created);
+    if (s_dls_activity_log_failures_remaining > 0) {
+      s_dls_activity_log_failures_remaining--;
+      return DATA_LOGGING_INTERNAL_ERR;
+    }
 
     ActivitySessionDataLoggingRecord *records = (ActivitySessionDataLoggingRecord *)data;
     for (int i = 0; i < num_items; i++) {
@@ -246,6 +254,10 @@ DataLoggingSession *dls_create(uint32_t tag, DataLoggingItemType item_type, uint
     return (DataLoggingSession *)DataLoggingSession_AccelSamples;
 
   } else if (tag == DlsSystemTagActivitySession) {
+    if (s_dls_activity_create_failures_remaining > 0) {
+      s_dls_activity_create_failures_remaining--;
+      return NULL;
+    }
     s_dls_activity_sessions_created = true;
     cl_assert_equal_i(item_size, sizeof(ActivitySessionDataLoggingRecord));
     return (DataLoggingSession *)DataLoggingSession_ActivitySessions;
@@ -1667,6 +1679,86 @@ void test_activity__get_sleep_sessions(void) {
   // Assert that we got the same sleep sessions using the activity service as we do using
   // the health API
   prv_assert_equal_activity_and_health_sleep_sessions(4);
+}
+
+// ---------------------------------------------------------------------------------------
+// A failed activity-session append used to advance the persistent export watermark anyway.
+// Sleep is finalized only once after waking, so that converted a transient PFS failure into a
+// permanent "No sleep data" gap. Exercise every failure boundary and print the captured state on
+// assertion failure; these diagnostics exist only in the host test binary.
+void test_activity__sleep_export_retries_without_skipping_or_duplicating_sessions(void) {
+  ActivityState *state = activity_private_state();
+  const time_t now = rtc_get_time();
+  const ActivitySession sessions[] = {
+      {
+          .type = ActivitySessionType_Sleep,
+          .start_utc = now - 4 * SECONDS_PER_HOUR,
+          .length_min = 60,
+      },
+      {
+          .type = ActivitySessionType_Sleep,
+          .start_utc = now - 2 * SECONDS_PER_HOUR,
+          .length_min = 60,
+      },
+      {
+          .type = ActivitySessionType_RestfulSleep,
+          .start_utc = now - 3 * SECONDS_PER_HOUR,
+          .length_min = 30,
+      },
+      {
+          .type = ActivitySessionType_Walk,
+          .start_utc = now - SECONDS_PER_HOUR,
+          .length_min = 20,
+      },
+  };
+
+  memcpy(state->activity_sessions, sessions, sizeof(sessions));
+  state->activity_sessions_count = ARRAY_LENGTH(sessions);
+  state->sleep_sessions_modified = false;
+  state->sleep_data.cur_state = ActivitySleepStateAwake;
+  state->logged_sleep_activity_exit_at_utc = 0;
+  state->logged_restful_sleep_activity_exit_at_utc = 0;
+  state->logged_step_activity_exit_at_utc = 0;
+  prv_reset_captured_dls_data();
+
+  // A session-open failure must leave every class retryable.
+  s_dls_activity_create_failures_remaining = 1;
+  activity_sessions_prv_minute_handler(now);
+  printf("\ncreate failure: records=%d sleep=%ld deep=%ld step=%ld",
+         s_num_dls_activity_records, (long)state->logged_sleep_activity_exit_at_utc,
+         (long)state->logged_restful_sleep_activity_exit_at_utc,
+         (long)state->logged_step_activity_exit_at_utc);
+  cl_assert_equal_i(s_num_dls_activity_records, 2);
+  cl_assert_equal_i(state->logged_sleep_activity_exit_at_utc, 0);
+  cl_assert_equal_i(state->logged_restful_sleep_activity_exit_at_utc,
+                    sessions[2].start_utc + sessions[2].length_min * SECONDS_PER_MINUTE);
+  cl_assert_equal_i(state->logged_step_activity_exit_at_utc,
+                    sessions[3].start_utc + sessions[3].length_min * SECONDS_PER_MINUTE);
+
+  // The two ordinary sleep records share a watermark. The first failed record blocks the second
+  // for that pass, while independent deep-sleep and step classes are still allowed to progress.
+  s_dls_activity_log_failures_remaining = 1;
+  activity_sessions_prv_minute_handler(now + SECONDS_PER_MINUTE);
+  printf("\nlog failure: records=%d sleep=%ld deep=%ld step=%ld",
+         s_num_dls_activity_records, (long)state->logged_sleep_activity_exit_at_utc,
+         (long)state->logged_restful_sleep_activity_exit_at_utc,
+         (long)state->logged_step_activity_exit_at_utc);
+  cl_assert_equal_i(s_num_dls_activity_records, 2);
+  cl_assert_equal_i(state->logged_sleep_activity_exit_at_utc, 0);
+
+  // Once storage accepts records, both missed sleeps are delivered in order and the watermark
+  // advances to the newest accepted end time.
+  activity_sessions_prv_minute_handler(now + 2 * SECONDS_PER_MINUTE);
+  printf("\nretry success: records=%d sleep=%ld expected=%ld",
+         s_num_dls_activity_records, (long)state->logged_sleep_activity_exit_at_utc,
+         (long)(sessions[1].start_utc + sessions[1].length_min * SECONDS_PER_MINUTE));
+  cl_assert_equal_i(s_num_dls_activity_records, 4);
+  cl_assert_equal_i(state->logged_sleep_activity_exit_at_utc,
+                    sessions[1].start_utc + sessions[1].length_min * SECONDS_PER_MINUTE);
+
+  // Re-running the minute handler is the at-least-once boundary: accepted records do not repeat.
+  activity_sessions_prv_minute_handler(now + 3 * SECONDS_PER_MINUTE);
+  cl_assert_equal_i(s_num_dls_activity_records, 4);
 }
 
 // ---------------------------------------------------------------------------------------

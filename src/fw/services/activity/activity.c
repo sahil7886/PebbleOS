@@ -1602,7 +1602,7 @@ static void prv_send_fake_dls_records_system_cb(void *context_param) {
       .length_min = 10,
       .type = activity,
     };
-    activity_sessions_prv_send_activity_session_to_data_logging(&session);
+    (void)activity_sessions_prv_send_activity_session_to_data_logging(&session);
     session_start_utc += 20 * SECONDS_PER_MINUTE;
   }
 

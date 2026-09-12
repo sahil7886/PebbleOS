@@ -507,7 +507,9 @@ void activity_sessions_prv_delete_activity_session(ActivitySession *session);
 void activity_sessions_prv_minute_handler(time_t utc_sec);
 
 //! Send an activity session to data logging
-void activity_sessions_prv_send_activity_session_to_data_logging(ActivitySession *session);
+//! Returns true only after DataLogging has accepted the complete record. Callers that persist an
+//! export watermark must leave it unchanged on false so the record is retried.
+bool activity_sessions_prv_send_activity_session_to_data_logging(ActivitySession *session);
 
 // ---------------------------------------------------------------------------
 // Activity Metrics

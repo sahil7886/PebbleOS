@@ -312,7 +312,7 @@ unlock:
 
 // --------------------------------------------------------------------------------------------
 // Send an activity session (including sleep sessions) to data logging
-void activity_sessions_prv_send_activity_session_to_data_logging(ActivitySession *session) {
+bool activity_sessions_prv_send_activity_session_to_data_logging(ActivitySession *session) {
   ActivityState *state = activity_private_state();
   time_t start_local = time_utc_to_local(session->start_utc);
   ActivitySessionDataLoggingRecord dls_record = {
@@ -339,7 +339,7 @@ void activity_sessions_prv_send_activity_session_to_data_logging(ActivitySession
                                              sizeof(dls_record), buffered, resume, &system_uuid);
     if (!state->activity_dls_session) {
       PBL_LOG_WRN("Error creating activity DLS session");
-      return;
+      return false;
     }
   }
 
@@ -347,12 +347,14 @@ void activity_sessions_prv_send_activity_session_to_data_logging(ActivitySession
   DataLoggingResult result = dls_log(state->activity_dls_session, &dls_record, 1);
   if (result != DATA_LOGGING_SUCCESS) {
     PBL_LOG_WRN("Error %" PRIi32 " while logging activity to DLS", (int32_t)result);
+    return false;
   }
   PBL_LOG_INFO("Logging activity event %d, start_time: %" PRIu32
                ", "
                "elapsed_min: %" PRIu16 ", end_time: %" PRIu32 " ",
                (int)session->type, (uint32_t)session->start_utc, session->length_min,
                (uint32_t)session->start_utc + (session->length_min * SECONDS_PER_MINUTE));
+  return true;
 }
 
 // This structure holds stats we collected from going through a list of sleep sessions. It is
@@ -572,15 +574,18 @@ static void prv_log_activities(time_t now_utc) {
     ActivitySettingsKey key;  // settings key used to store last UTC time for this activity class
     time_t *exit_utc;         // pointer to last UTC time in our globals
     bool modified;            // true if we need to update it.
+    bool blocked;             // a prior record in this class was not accepted; preserve ordering
   } ActivityClassParams;
 
   ActivityClassParams class_settings[ActivityClassCount] = {
-      {ActivitySettingsKeyLastSleepActivityUTC, &state->logged_sleep_activity_exit_at_utc, false},
+      {ActivitySettingsKeyLastSleepActivityUTC, &state->logged_sleep_activity_exit_at_utc,
+       false, false},
 
       {ActivitySettingsKeyLastRestfulSleepActivityUTC,
-       &state->logged_restful_sleep_activity_exit_at_utc, false},
+       &state->logged_restful_sleep_activity_exit_at_utc, false, false},
 
-      {ActivitySettingsKeyLastStepActivityUTC, &state->logged_step_activity_exit_at_utc, false},
+      {ActivitySettingsKeyLastStepActivityUTC, &state->logged_step_activity_exit_at_utc,
+       false, false},
   };
 
   bool logged_event = false;
@@ -615,7 +620,7 @@ static void prv_log_activities(time_t now_utc) {
     PBL_ASSERTN(params);
 
     // If this is an event we already logged, or it's still ongoing, don't log it
-    if (session->ongoing || (session_exit_utc <= *params->exit_utc)) {
+    if (params->blocked || session->ongoing || (session_exit_utc <= *params->exit_utc)) {
       continue;
     }
 
@@ -629,7 +634,12 @@ static void prv_log_activities(time_t now_utc) {
     }
 
     // Log this event
-    activity_sessions_prv_send_activity_session_to_data_logging(session);
+    if (!activity_sessions_prv_send_activity_session_to_data_logging(session)) {
+      // Never advance past a record DataLogging did not accept. In particular, a transient PFS
+      // failure at wake-up must not turn a complete night into a permanent gap on the phone.
+      params->blocked = true;
+      continue;
+    }
     *params->exit_utc = session_exit_utc;
     params->modified = true;
     logged_event = true;
