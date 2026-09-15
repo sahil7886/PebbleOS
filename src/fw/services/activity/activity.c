@@ -535,9 +535,9 @@ static void NOINLINE prv_process_minute_data_tail(time_t utc_sec) {
   sleep_capture_minute_handler(utc_sec, activity_prefs_heart_rate_is_enabled(), sleep_active,
                                activity_prefs_enhanced_overnight_hr_logging_is_enabled());
 
-  mutex_lock_recursive(s_activity_state.mutex);
+  pbl_mutex_lock(&s_activity_state.mutex, PBL_FOREVER);
   prv_heart_rate_subscription_update(time_get_uptime_seconds());
-  mutex_unlock_recursive(s_activity_state.mutex);
+  pbl_mutex_unlock(&s_activity_state.mutex);
 
   // Send the history update event now if history has changed
   if (need_history_update_event) {
