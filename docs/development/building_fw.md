@@ -6,6 +6,26 @@ Before building, make sure you've configured {doc}`pbl <../development/options>`
 pbl build
 ```
 
+## Workspace path
+
+Build PebbleOS from a checkout whose absolute path contains no whitespace. The Moddable
+host-source generator writes absolute source paths into makefiles, and GNU Make cannot
+consume those generated paths when they contain spaces.
+
+If your normal checkout has whitespace in its path, create a temporary Git worktree at
+a no-whitespace path instead of copying the repository:
+
+```shell
+git worktree add --detach /tmp/pebbleos-build-src HEAD
+cd /tmp/pebbleos-build-src
+git submodule update --init --recursive
+pbl configure --board obelix@pvt
+pbl build
+```
+
+Keep the build directory at a no-whitespace path as well. After preserving any artifacts
+you need, remove the temporary worktree with `git worktree remove /tmp/pebbleos-build-src`.
+
 ## Loading firmware with a firmware development kit
 
 Before attempting to flash, check the documentation for each {doc}`board <../boards/index>` on how to prepare and connect your watch for programming.
