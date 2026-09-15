@@ -130,6 +130,9 @@ static WorkoutHeartRateDataLoggingRecord s_hr_dls_records[32];
 static WorkoutPpiDataLoggingRecord s_ppi_dls_records[32];
 static size_t s_num_hr_dls_records;
 static size_t s_num_ppi_dls_records;
+static size_t s_num_hr_dls_finishes;
+static size_t s_num_ppi_dls_finishes;
+static bool s_reject_system_task_callbacks;
 
 DataLoggingSession *dls_create(uint32_t tag, DataLoggingItemType item_type, uint16_t item_size,
                                bool buffered, bool resume, const Uuid *uuid) {
@@ -174,15 +177,20 @@ void dls_finish(DataLoggingSession *session) {
   if (session == (DataLoggingSession *)DataLoggingSession_WorkoutHeartRate) {
     cl_assert(s_hr_dls_active);
     s_hr_dls_active = false;
+    ++s_num_hr_dls_finishes;
   } else if (session == (DataLoggingSession *)DataLoggingSession_WorkoutPpi) {
     cl_assert(s_ppi_dls_active);
     s_ppi_dls_active = false;
+    ++s_num_ppi_dls_finishes;
   } else {
     cl_assert(false);
   }
 }
 
 bool system_task_add_callback(SystemTaskEventCallback cb, void *data) {
+  if (s_reject_system_task_callbacks) {
+    return false;
+  }
   cb(data);
   return true;
 }
@@ -275,6 +283,9 @@ void test_workout_service__initialize(void) {
   s_ppi_dls_active = false;
   s_num_hr_dls_records = 0;
   s_num_ppi_dls_records = 0;
+  s_num_hr_dls_finishes = 0;
+  s_num_ppi_dls_finishes = 0;
+  s_reject_system_task_callbacks = false;
   s_abandoned_workout_notification_sent = false;
 
   const bool assert_all_unlocked = true;
@@ -699,6 +710,38 @@ void test_workout_service__ppi_logging_is_observational(void) {
                     (WORKOUT_PPI_LOGGING_VERSION << WORKOUT_PPI_VERSION_SHIFT) |
                         WORKOUT_PPI_FLAG_COMPLETE);
   cl_assert_equal_b(s_ppi_dls_active, false);
+}
+#endif
+
+#ifdef CONFIG_HRM_HRV
+// ---------------------------------------------------------------------------------------
+// If System Task shuts down or its queue rejects the completion callbacks, stopping a workout
+// must still close both DLS sessions synchronously. Otherwise each failed stop permanently
+// consumes two resumable session slots.
+void test_workout_service__callback_rejection_closes_all_logging_sessions_once(void) {
+  workout_service_frontend_opened();
+  cl_assert(workout_service_start_workout(ActivitySessionType_Run));
+
+  prv_put_bpm_event(142, HRMQuality_Good);
+  prv_put_ppi_event(421, HRMQuality_Excellent);
+  cl_assert_equal_b(s_hr_dls_active, true);
+  cl_assert_equal_b(s_ppi_dls_active, true);
+  cl_assert_equal_i(s_num_hr_dls_finishes, 0);
+  cl_assert_equal_i(s_num_ppi_dls_finishes, 0);
+
+  s_reject_system_task_callbacks = true;
+  cl_assert(workout_service_stop_workout());
+
+  cl_assert_equal_b(s_hr_dls_active, false);
+  cl_assert_equal_b(s_ppi_dls_active, false);
+  cl_assert_equal_i(s_num_hr_dls_finishes, 1);
+  cl_assert_equal_i(s_num_ppi_dls_finishes, 1);
+
+  // A second stop is a no-op and cannot close either session twice.
+  cl_assert_equal_b(workout_service_stop_workout(), false);
+  cl_assert_equal_i(s_num_hr_dls_finishes, 1);
+  cl_assert_equal_i(s_num_ppi_dls_finishes, 1);
+  s_reject_system_task_callbacks = false;
 }
 #endif
 

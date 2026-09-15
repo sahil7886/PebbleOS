@@ -405,16 +405,22 @@ static void prv_system_task_hrm_handler(void *context) {
   pbl_mutex_unlock(&s_manager_state.lock);
 }
 
-// Assumes that s_manager_state.lock is held
-static void prv_queue_system_task_event(const PebbleHRMEvent *event) {
-  const uint16_t free_space =
-      circular_buffer_get_read_space_remaining(&s_manager_state.system_task_event_buffer);
-  if (free_space < sizeof(PebbleHRMEvent)) {
-    circular_buffer_consume(&s_manager_state.system_task_event_buffer, sizeof(PebbleHRMEvent));
+// Assumes that s_manager_state.lock is held. Returns true when the queue grew and therefore needs
+// another System Task callback. Replacing an event in a full queue reuses the evicted event's
+// already-pending callback.
+static bool prv_queue_system_task_event(const PebbleHRMEvent *event) {
+  CircularBuffer *buffer = &s_manager_state.system_task_event_buffer;
+  const uint16_t write_space = circular_buffer_get_write_space_remaining(buffer);
+  bool callback_needed = true;
+  if (write_space < sizeof(*event)) {
+    const bool consumed = circular_buffer_consume(buffer, sizeof(*event));
+    PBL_ASSERTN(consumed);
     ++s_manager_state.dropped_events;
+    callback_needed = false;
   }
-  circular_buffer_write(&s_manager_state.system_task_event_buffer,
-                        (const uint8_t *)event, sizeof(PebbleHRMEvent));
+  const bool written = circular_buffer_write(buffer, (const uint8_t *)event, sizeof(*event));
+  PBL_ASSERTN(written);
+  return callback_needed;
 }
 
 static void prv_populate_hrm_event(PebbleHRMEvent *event, HRMFeature feature, const HRMData *data) {
@@ -482,8 +488,9 @@ static bool prv_event_put(HRMSubscriberState *state, PebbleHRMEvent *event) {
       };
       success = (pbl_msgq_put(state->queue, &e, PBL_NO_WAIT) == 0);
     } else {
-      prv_queue_system_task_event(event);
-      success = system_task_add_callback(prv_system_task_hrm_handler, NULL);
+      const bool callback_needed = prv_queue_system_task_event(event);
+      success = !callback_needed ||
+          system_task_add_callback(prv_system_task_hrm_handler, NULL);
     }
     return success;
 }

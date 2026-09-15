@@ -822,12 +822,14 @@ static bool prv_stop_workout(uint32_t expected_workout_id) {
     if (!system_task_add_callback(prv_finish_workout_heart_rate_dls_session,
                                   heart_rate_dls_finish_data)) {
       PBL_LOG_WRN("Unable to finish workout HR logging session");
+      dls_finish(heart_rate_dls_finish_data->session);
       kernel_free(heart_rate_dls_finish_data);
     }
   }
   if (ppi_dls_finish_data) {
     if (!system_task_add_callback(prv_finish_workout_ppi_dls_session, ppi_dls_finish_data)) {
       PBL_LOG_WRN("Unable to finish workout PPI logging session");
+      dls_finish(ppi_dls_finish_data->session);
       kernel_free(ppi_dls_finish_data);
     }
   }

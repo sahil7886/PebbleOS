@@ -127,6 +127,8 @@ HRMSessionRef s_hrm_next_session_ref = 1;
 static uint32_t s_hrm_manager_update_interval;
 static int s_hrm_manager_num_update_interval_changes;
 static uint16_t s_hrm_manager_expire_s;
+static HRMFeature s_hrm_manager_features;
+static int s_hrm_manager_num_feature_changes;
 HRMSessionRef hrm_manager_subscribe_with_callback(AppInstallId app_id, uint32_t update_interval_s,
                                                   uint16_t expire_s, HRMFeature features,
                                                   HRMSubscriberCallback callback, void *context) {
@@ -146,6 +148,13 @@ bool sys_hrm_manager_set_update_interval(HRMSessionRef session, uint32_t update_
   s_hrm_manager_update_interval = update_interval_s;
   s_hrm_manager_expire_s = expire_s;
   s_hrm_manager_num_update_interval_changes++;
+  return true;
+}
+
+bool sys_hrm_manager_set_features(HRMSessionRef session, HRMFeature features) {
+  cl_assert(session < s_hrm_next_session_ref);
+  s_hrm_manager_features = features;
+  s_hrm_manager_num_feature_changes++;
   return true;
 }
 
@@ -292,11 +301,13 @@ bool protobuf_log_hr_add_sample(ProtobufLogRef ref, time_t now_utc, uint8_t bpm,
   return true;
 }
 
+static bool s_sleep_capture_active;
+
 void sleep_capture_minute_handler(uint32_t utc_sec, bool heart_rate_enabled, bool sleep_active,
                                   bool enhanced_logging_enabled) {}
 
 bool sleep_capture_is_active(void) {
-  return false;
+  return s_sleep_capture_active;
 }
 
 void sleep_capture_handle_hrm_event(const PebbleHRMEvent *event) {}
@@ -992,6 +1003,10 @@ void test_activity__initialize(void) {
   pfs_format(false);
 
   prv_activity_algorithm_erase_minute_data();
+  s_sleep_capture_active = false;
+  s_hrm_manager_features = HRMFeature_BPM;
+  s_hrm_manager_num_feature_changes = 0;
+  s_hrm_manager_num_update_interval_changes = 0;
   prv_activity_init_and_set_enabled(true);
 
   // Set default user settings
@@ -2492,6 +2507,60 @@ void test_activity__hrm_sampling_period(void) {
     }
   }
   cl_assert_equal_i(s_hrm_manager_update_interval, 1);
+}
+
+// ---------------------------------------------------------------------------------------
+// Enhanced sleep capture temporarily owns the Activity HRM subscription at 1 Hz with HRV. On
+// every exit path it must restore BPM-only mode and physically stop the continuous subscription,
+// not merely update Activity's bookkeeping.
+void test_activity__sleep_capture_hrv_override_restores_background_sampling(void) {
+  activity_start_tracking(false /* test_mode */);
+  fake_system_task_callbacks_invoke_pending();
+  s_test_alg_state.orientation = 0x11;  // Not flat
+
+  activity_prefs_set_hrm_measurement_interval(HRMonitoringInterval_Disabled);
+  s_sleep_capture_active = true;
+  prv_minute_system_task_cb(NULL);
+  cl_assert_equal_i(s_hrm_manager_features, HRMFeature_BPM | HRMFeature_HRV);
+  cl_assert_equal_i(s_hrm_manager_update_interval, ACTIVITY_HRM_SUBSCRIPTION_ON_PERIOD_SEC);
+
+  const int disabled_exit_interval_changes = s_hrm_manager_num_update_interval_changes;
+  const int disabled_exit_feature_changes = s_hrm_manager_num_feature_changes;
+  s_sleep_capture_active = false;
+  prv_minute_system_task_cb(NULL);
+  cl_assert_equal_i(s_hrm_manager_features, HRMFeature_BPM);
+  cl_assert_equal_i(s_hrm_manager_update_interval, ACTIVITY_HRM_SUBSCRIPTION_OFF_PERIOD_SEC);
+  cl_assert_equal_i(s_hrm_manager_num_update_interval_changes,
+                    disabled_exit_interval_changes + 1);
+  cl_assert_equal_i(s_hrm_manager_num_feature_changes, disabled_exit_feature_changes + 1);
+
+  // Repeated inactive minutes must not issue redundant feature or interval changes.
+  const int stable_interval_changes = s_hrm_manager_num_update_interval_changes;
+  const int stable_feature_changes = s_hrm_manager_num_feature_changes;
+  prv_minute_system_task_cb(NULL);
+  cl_assert_equal_i(s_hrm_manager_num_update_interval_changes, stable_interval_changes);
+  cl_assert_equal_i(s_hrm_manager_num_feature_changes, stable_feature_changes);
+
+  // The enabled background policy also starts its normal interval from capture exit. It must not
+  // inherit continuous sampling, but it should resume at the configured boundary.
+  activity_prefs_set_hrm_measurement_interval(HRMonitoringInterval_10Min);
+  s_sleep_capture_active = true;
+  prv_minute_system_task_cb(NULL);
+  cl_assert_equal_i(s_hrm_manager_update_interval, ACTIVITY_HRM_SUBSCRIPTION_ON_PERIOD_SEC);
+
+  s_sleep_capture_active = false;
+  prv_minute_system_task_cb(NULL);
+  cl_assert_equal_i(s_hrm_manager_update_interval, ACTIVITY_HRM_SUBSCRIPTION_OFF_PERIOD_SEC);
+
+  fake_rtc_increment_time((10 * SECONDS_PER_MINUTE) - 1);
+  fake_rtc_increment_ticks(((10 * SECONDS_PER_MINUTE) - 1) * PBL_TICK_HZ);
+  prv_minute_system_task_cb(NULL);
+  cl_assert_equal_i(s_hrm_manager_update_interval, ACTIVITY_HRM_SUBSCRIPTION_OFF_PERIOD_SEC);
+
+  fake_rtc_increment_time(1);
+  fake_rtc_increment_ticks(PBL_TICK_HZ);
+  prv_minute_system_task_cb(NULL);
+  cl_assert_equal_i(s_hrm_manager_update_interval, ACTIVITY_HRM_SUBSCRIPTION_ON_PERIOD_SEC);
 }
 
 // ---------------------------------------------------------------------------------------

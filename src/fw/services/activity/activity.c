@@ -104,9 +104,16 @@ static void prv_heart_rate_subscription_update(uint32_t now_ts) {
     return;
   }
   if (s_sleep_capture_hrv_requested) {
-    sys_hrm_manager_set_features(s_activity_state.hr.hrm_session, HRMFeature_BPM);
+    bool success = sys_hrm_manager_set_features(s_activity_state.hr.hrm_session, HRMFeature_BPM);
+    PBL_ASSERTN(success);
     s_sleep_capture_hrv_requested = false;
-    // Resume the normal background-HR policy.
+
+    // End the continuous capture override before resuming the normal background-HR policy.
+    // Merely changing currently_sampling would leave the underlying subscription at 1 Hz.
+    success = sys_hrm_manager_set_update_interval(s_activity_state.hr.hrm_session,
+                                                  ACTIVITY_HRM_SUBSCRIPTION_OFF_PERIOD_SEC,
+                                                  0 /* expire_sec */);
+    PBL_ASSERTN(success);
     s_activity_state.hr.currently_sampling = false;
     s_activity_state.hr.toggled_sampling_at_ts = now_ts;
   }

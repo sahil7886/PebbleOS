@@ -550,6 +550,64 @@ void test_hrm_manager__multiple_system_task_data_callbacks(void) {
   sys_hrm_manager_unsubscribe(session_ref_2);
 }
 
+// The KernelBG bridge has a deliberately small queue. It must use all available slots without
+// reporting a false drop, then evict exactly the oldest complete event on overflow. This verifies
+// capacity, accounting, FIFO order, and recovery after the queued callbacks drain.
+void test_hrm_manager__system_task_event_buffer_capacity_and_overflow(void) {
+  stub_pebble_tasks_set_current(PebbleTask_KernelBackground);
+  HRMSessionRef session_ref = hrm_manager_subscribe_with_callback(
+      INSTALL_ID_INVALID, 1, SECONDS_PER_MINUTE, HRMFeature_BPM, prv_fake_hrm_1_cb, NULL);
+  fake_system_task_callbacks_invoke_pending();
+
+  const uint8_t first_bpm = 60;
+  for (uint8_t i = 0; i < NUM_EVENTS_TO_QUEUE; ++i) {
+    const HRMData data = {
+      .features = HRMFeature_BPM,
+      .hrm_bpm = first_bpm + i,
+      .hrm_quality = HRMQuality_Excellent,
+    };
+    hrm_manager_new_data_cb(&data);
+  }
+
+  cl_assert_equal_i(prv_num_system_task_events_queued(), NUM_EVENTS_TO_QUEUE);
+  cl_assert_equal_i(fake_system_task_count_callbacks(), NUM_EVENTS_TO_QUEUE);
+  cl_assert_equal_i(prv_get_dropped_events_count(), 0);
+  cl_assert_equal_i(s_num_cb_events_1, 0);
+
+  const HRMData overflow_data = {
+    .features = HRMFeature_BPM,
+    .hrm_bpm = first_bpm + NUM_EVENTS_TO_QUEUE,
+    .hrm_quality = HRMQuality_Excellent,
+  };
+  hrm_manager_new_data_cb(&overflow_data);
+
+  cl_assert_equal_i(prv_num_system_task_events_queued(), NUM_EVENTS_TO_QUEUE);
+  cl_assert_equal_i(fake_system_task_count_callbacks(), NUM_EVENTS_TO_QUEUE);
+  cl_assert_equal_i(prv_get_dropped_events_count(), 1);
+
+  fake_system_task_callbacks_invoke_pending();
+  cl_assert_equal_i(s_num_cb_events_1, NUM_EVENTS_TO_QUEUE);
+  for (uint8_t i = 0; i < NUM_EVENTS_TO_QUEUE; ++i) {
+    cl_assert_equal_i(s_cb_events_1[i].event_type, HRMEvent_BPM);
+    cl_assert_equal_i(s_cb_events_1[i].bpm.bpm, first_bpm + i + 1);
+    cl_assert_equal_i(s_cb_events_1[i].bpm.quality, HRMQuality_Excellent);
+  }
+  cl_assert_equal_i(prv_num_system_task_events_queued(), 0);
+
+  const HRMData recovery_data = {
+    .features = HRMFeature_BPM,
+    .hrm_bpm = 99,
+    .hrm_quality = HRMQuality_Good,
+  };
+  hrm_manager_new_data_cb(&recovery_data);
+  fake_system_task_callbacks_invoke_pending();
+  cl_assert_equal_i(s_num_cb_events_1, NUM_EVENTS_TO_QUEUE + 1);
+  cl_assert_equal_i(s_cb_events_1[NUM_EVENTS_TO_QUEUE].bpm.bpm, 99);
+  cl_assert_equal_i(prv_get_dropped_events_count(), 1);
+
+  sys_hrm_manager_unsubscribe(session_ref);
+}
+
 void test_hrm_manager__set_features(void) {
   AppInstallId  app_id = 1;
   const uint16_t expire_s = SECONDS_PER_MINUTE;
